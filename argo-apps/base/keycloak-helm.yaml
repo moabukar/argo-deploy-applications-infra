@@ -1,0 +1,177 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: infra-keycloak-helm
+  namespace: argocd
+
+  # Add this finalizer ONLY if you want these to cascade delete (A cascade delete, deletes both the app and its resources, rather than only the app.)
+  # finalizers:
+  #   - resources-finalizer.argocd.argoproj.io
+  
+spec:
+  project: default
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      
+  source:
+    chart: keycloak
+    repoURL: https://charts.bitnami.com/bitnami
+    targetRevision: 21.4.3
+  
+    # https://github.com/bitnami/charts/tree/main/bitnami/keycloak
+    helm:
+      valuesObject:
+        fullnameOverride: keycloak
+
+        ## Resources ##
+        # resources:
+        #   requests:
+        #     cpu: 512m
+        #     memory: 3Gi
+        #   limits:
+        #     # cpu: without limit
+        #     memory: 3Gi
+
+        ## Configuration ##
+        extraEnvVars:
+          # Needed for testing locally.
+          # - name: KC_HOSTNAME_STRICT
+          #   value: "false"
+          # - name: KC_HOSTNAME
+          #   value: "keycloak.keycloak.svc.cluster.local"
+          # - name: KC_HOSTNAME_ADMIN_URL
+          #   value: "http://identity-local.cloud-diplomats.com"
+
+          # --features="persistent-user-sessions" # If a session is not found in memory, it is loaded from the database (https://www.keycloak.org/2024/06/persistent-user-sessions-in-preview)
+      
+        ## Mode ##
+        # --proxy deprecated in 24.0 
+        # -> strict hostname: --hostname="your-domain" --hostname-admin="your-domain" --hostname-strict=true
+        # -> derived from LB headers: --proxy-headers=forwarded|xforwarded --hostname-strict=false
+        production: false
+        proxy: edge
+
+        ## Replica ##
+        # autoscaling:
+        #   enabled: true
+        #   minReplicas: 1
+        #   maxReplicas: 2
+        #   targetMemory: "85"
+
+        # pdb:
+        #   create: true
+
+        ## Monitoring ##
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            namespace: keycloak
+            labels:
+              prometheus.io/scrap-with: kube-prometheus-stack
+
+        ## Auth ##
+        auth:
+          adminUser: admin
+          existingSecret: keycloak-secrets
+        extraEnvVarsSecret: keycloak-secrets
+
+        extraDeploy:
+          - |
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: keycloak-secrets
+              namespace: keycloak
+            stringData:
+              admin-password: password              
+
+        ## Database ##
+        postgresql:
+          fullnameOverride: postgres
+          commonAnnotations:
+            argocd.argoproj.io/sync-wave: "-1"
+          auth:
+            database: keycloak
+            postgresPassword: password
+            username: admin
+            password: password
+
+        ## Network ##
+        service: 
+          type: ClusterIP
+
+        ingress:
+          enabled: true
+          ingressClassName: nginx
+          hostname: identity${ARGOCD_ENV_DNS_ENV}.${ARGOCD_ENV_DNS_DOMAIN}
+          tls: true
+          annotations:
+            nginx.ingress.kubernetes.io/proxy-buffer-size: "128k" # A common issue with Keycloak and nginx is that the proxy buffer may be too small for what Keycloak is trying to send. This will result in a Bad Gateway (502) error.
+            # nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            # nginx.ingress.kubernetes.io/server-snippet: |
+            #   # Restrict Index
+            #   location = "/" {
+            #     deny all;
+            #     return 404;
+            #   }
+
+            #   # Restrict Metrics API
+            #   location /metrics {
+            #       deny all;
+            #       return 403;
+            #   }
+
+            #   # Restrict Admin console
+            #   location /admin {
+            #     deny all;
+            #     return 403;
+            #   }
+
+            #   # Restrict any master realm access
+            #   location /realms/master {
+            #     deny all;
+            #     return 403;
+            #   }
+
+        ## Plugins ##
+        initContainers:
+          - name: download-kc-plugins
+            image: alpine:3.19.1
+            command:
+              - sh
+            args:
+              - -c
+              - |
+                KC_METRICS_VERSION="5.0.0"
+                KC_METRICS_URL="https://github.com/aerogear/keycloak-metrics-spi/releases/download/$KC_METRICS_VERSION/keycloak-metrics-spi-$KC_METRICS_VERSION.jar"
+                wget "$KC_URL" -O /providers/keycloak-metrics-spi.jar
+                chmod +x /providers/keycloak-metrics-spi.jar
+                touch /providers/keycloak-metrics-spi.jar.dodeploy
+
+            volumeMounts:
+              - name: providers
+                mountPath: /providers
+
+        extraVolumeMounts:
+          - name: providers
+            mountPath: /opt/bitnami/keycloak/providers
+
+        extraVolumes:
+          - name: providers
+            emptyDir: {}
+
+  destination:
+    server: "https://kubernetes.default.svc"
+    namespace: keycloak
+
+  # Only used for local testing.
+  ignoreDifferences:
+    - kind: Secret
+      name: keycloak-cert
+      namespace: keycloak
+      jsonPointers:
+        - /data/tls.crt
+        - /data/tls.key
